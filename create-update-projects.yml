@@ -2,7 +2,6 @@ name: create-projects-azure-devops
 trigger: none
 pr: none
 
-#each subscription used in the pipeline will for automation will have  a full resource id for storage account, for vault 
 parameters:
   - name: payload
     type: string
