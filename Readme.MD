@@ -24,6 +24,6 @@ The azure devops repository must use an app registrarion {{parameters.automation
 
 Typical required roles include:
 
--[ORG]\Project Collection Administrators
+- [ORG]\Project Collection Administrators
 
--[ORG]\Project Collection Build Service Accounts
+- [ORG]\Project Collection Build Service Accounts
