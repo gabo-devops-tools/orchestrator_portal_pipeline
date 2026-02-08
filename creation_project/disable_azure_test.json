@@ -1,0 +1,8 @@
+{
+    "featureId": "ms.vss-test-web.test",
+    "scope": {
+        "userScoped": false,
+        "settingScope": "project"
+    },
+    "state": 0
+}

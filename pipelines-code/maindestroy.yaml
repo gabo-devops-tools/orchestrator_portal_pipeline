@@ -1,0 +1,103 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+parameters:
+- name: environment
+  displayName: 'environment'
+  values:
+    - ENVNAMES
+- name: mode
+  displayName: 'mode'
+  default: test
+  values:
+  - test
+  - deploy
+- name: agentPool
+  type: string
+  default: 'aks pool'
+  values:
+  - Azure Pipelines #default one
+  - aks pool
+- name: architecture
+  displayName: 'architecture'
+  default: arm64
+  values:
+  - amd64
+  - arm64
+trigger: none
+#cannot use on runtime , #(AGENT_POOL) variable group 
+#this need to be paramater which is compile time
+#at this scope need to be hardcoded cannot be parameterized, movingthis inside stages
+# pool:
+#   name: ${{ parameters.agentPool }}
+variables:
+#  - name: System.Debug
+#    value: true
+  - group: "code-PROJECTNAME-${{ parameters.environment }}"
+stages:
+- stage: discovery_stage
+  jobs:
+  - deployment: deploy
+    displayName: intro step
+    environment: ${{ parameters.environment }}
+    pool:
+      name: ${{ parameters.agentPool }}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              git config --system --unset-all http.extraheader || true
+              git config --global --unset-all http.extraheader || true
+              git config --unset-all http.extraheader || true
+            displayName: 'cleanup credentials on runners'
+          - checkout: self
+  - job: Setup
+    #add the app reg used in the self hosted runner inside of the [project]\Contributors to allow him to clone or it will say 400 unauthorized
+    pool:
+      name: ${{ parameters.agentPool }}
+    steps:
+    - script: |
+        git config --system --unset-all http.extraheader || true
+        git config --global --unset-all http.extraheader || true
+        git config --unset-all http.extraheader || true
+      displayName: 'cleanup credentials on runners'
+    - checkout: self
+      clean: true
+      persistCredentials: true
+      fetchDepth: 0
+    - script: |
+        echo "Org URL: $(System.TeamFoundationCollectionUri)"
+        echo "Project: $(System.TeamProject)"
+        echo "Repository: $(Build.Repository.Name)"
+        echo "Repo URL: $(Build.Repository.Uri)"
+
+        # Extract org name from URL (bash example)
+        ORG_NAME=$(echo $(System.TeamFoundationCollectionUri) | cut -d'/' -f4)
+        echo "Organization: $ORG_NAME"
+        echo "##vso[task.setvariable variable=organization;isOutput=true]$ORG_NAME"
+        echo "##vso[task.setvariable variable=project;isOutput=true]$(System.TeamProject)"
+        echo "##vso[task.setvariable variable=repository;isOutput=true]$(Build.Repository.Name)"
+      name: reposettings
+      displayName: "Show Org , Project and repo"
+
+    - bash: |
+        echo -n "$(Agent.JobStatus)" > status.txt
+      displayName: set status on file
+
+    - publish: status.txt
+      artifact: status
+      displayName: set initial status
+
+#OPTION 1, dont use them as parameter, Library variables are already available inside the template.
+#OPTION 2 — Convert library variables to parameters (bridge pattern)
+- ${{ if eq(parameters.mode, 'deploy') }}:
+  - template: destroy.yaml
+    parameters:
+      environment: ${{ parameters.environment }}
+      project: $(System.TeamProject)
+      runnername: ${{ parameters.agentPool}}
+      architecture: ${{ parameters.architecture}}
+

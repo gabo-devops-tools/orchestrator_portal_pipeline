@@ -1,0 +1,8 @@
+{
+    "featureId": "ms.vss-work.agile",
+    "scope": {
+        "userScoped": false,
+        "settingScope": "project"
+    },
+    "state": 0
+}

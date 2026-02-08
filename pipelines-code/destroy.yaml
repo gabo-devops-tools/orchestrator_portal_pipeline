@@ -1,0 +1,280 @@
+parameters:
+  - name: buildconfig
+    type: string
+    default: 'Release'
+  - name: environment
+    type: string  
+  - name: project
+    default: ''
+    type: string  
+  - name: runnername
+    default: ''
+    type: string
+  - name: architecture
+    default: ''
+    type: string  
+stages:
+  - stage: base
+    displayName: separator
+    condition: false  # Always skips
+    jobs:
+    - job: Dummy
+      #add the app reg used in the self hosted runner inside of the [project]\Contributors to allow him to clone or it will say 400 unauthorized
+      pool:
+        name: ${{ parameters.runnername }}
+      steps:
+        - script: echo "This will not run"
+  - stage: buildapp
+    dependsOn: [ base] 
+    condition: in(dependencies.base.result, 'Skipped')
+    displayName: building for ${{parameters.environment}}
+    jobs:
+    - job: buildappjob
+      #add the app reg used in the self hosted runner inside of the [project]\Contributors to allow him to clone or it will say 400 unauthorized
+      pool:
+        name: ${{ parameters.runnername }}
+      steps:
+      - script: |
+          #!/bin/bash
+          set -e +H
+          # -e to exit on error
+          # +H to prevent history expansion
+          # Set the script's locale to UTF-8 to ensure proper handling of UTF-8 encoded text
+          export LANG=C.UTF-8
+          echo "container registry: $(acr)"
+          echo "environment: ${{parameters.environment}}"
+          echo "should_create_artifacts: $(should-create-artifacts)"
+          echo "should_build_image: $(should-build-images)"
+
+        displayName: 'parameter recieved run(linux)'
+        condition: eq(variables['Agent.OS'],'Linux') 
+
+      - task: UseDotNet@2
+        displayName: 'Install .NET 8.0 SDK'
+        inputs:
+          packageType: 'sdk'
+          version: '8.x' # Specify the version you need, e.g., '6.x', '7.x', '8.x'
+
+      - task: DotNetCoreCLI@2
+        displayName: 'dotnet restore'
+        inputs:
+          command: 'restore'
+          projects: '**/*.sln'
+          nugetConfigPath: '**/nuget.config'
+
+      - task: DotNetCoreCLI@2
+        displayName: 'dotnet build'
+        inputs:
+          command: 'build'
+          projects: '**/*.sln'
+          arguments: '--no-restore --configuration ${{parameters.buildconfig}}'
+          nugetConfigPath: '**/nuget.config'
+
+      - script: |
+          dotnet test --no-restore --configuration ${{parameters.buildconfig}} --logger trx --results-directory "$(Build.ArtifactStagingDirectory)/TestResults"
+
+          resultsPath="$(Build.ArtifactStagingDirectory)/TestResults"
+          echo "Checking test results in: $resultsPath"
+
+          if [ ! -d "$resultsPath" ] || [ -z "$(find "$resultsPath" -type f)" ]; then
+            echo "❌ No test results found. dotnet test may not have run."
+            exit 1
+          else
+            echo "✅ Test results found:"
+            find "$resultsPath" -type f
+          fi
+        displayName: 'Validate tests were run(linux)'
+        condition: eq(variables['Agent.OS'],'Linux') 
+
+    - job: pushartifacts
+      #add the app reg used in the self hosted runner inside of the [project]\Contributors to allow him to clone or it will say 400 unauthorized
+      pool:
+        name: ${{ parameters.runnername }}
+      dependsOn: 
+      - buildappjob
+      condition: eq(variables['should-create-artifacts'], 'true')   # is different true from 'true'
+      steps:
+      - task: NuGetAuthenticate@1
+        displayName: Authenticate to Azure Artifacts
+
+      - task: UseDotNet@2
+        displayName: 'Install .NET 8.0 SDK'
+        inputs:
+          packageType: 'sdk'
+          version: '8.x' # Specify the version you need, e.g., '6.x', '7.x', '8.x'
+
+      - task: DotNetCoreCLI@2
+        displayName: 'dotnet publish'
+        inputs:
+          command: 'publish'
+          publishWebProjects: true
+          arguments: ' --configuration ${{parameters.buildconfig}} --output $(build.artifactstagingdirectory)/artifacts'
+          zipAfterPublish: True
+          nugetConfigPath: '**/nuget.config'
+
+
+      - task: PublishBuildArtifacts@1
+        displayName: 'publish artifcats'
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)/artifacts'
+          ArtifactName: 'application'
+          publishLocation: 'Container'
+
+  - stage: builddocker
+    dependsOn: [ base] 
+    condition: or(and(eq(variables['should-build-image'], 'true'),in(dependencies.base.result, 'Skipped')),eq(variables['should-build-image'],'true'))
+    displayName: building for ${{parameters.environment}}
+    jobs:
+    - job: dockerimage
+      #add the app reg used in the self hosted runner inside of the [project]\Contributors to allow him to clone or it will say 400 unauthorized
+      pool:
+        name: ${{ parameters.runnername }}
+      steps:
+      #https://learn.microsoft.com/en-us/azure/devops/pipelines/tasks/reference/docker-installer-v0?view=azure-pipelines
+      # - task: DockerInstaller@0
+      #   displayName: Docker Installer
+      #   inputs:
+      #     dockerVersion: 17.09.0-ce
+      #     releaseType: stable
+      - script: |
+          #!/bin/bash
+          set -e +H
+          # -e to exit on error
+          # +H to prevent history expansion
+          # Set the script's locale to UTF-8 to ensure proper handling of UTF-8 encoded text
+          export LANG=C.UTF-8
+
+          IMAGE_VERSION=$(yq '.image_tag' values-${{parameters.environment}}.yaml)
+          IMAGE_NAME="$(yq '.product' values-${{parameters.environment}}.yaml)/$(yq '.application' values-${{parameters.environment}}.yaml)/$(yq '.role' values-${{parameters.environment}}.yaml)"
+          CHART_VERSION=$(yq '.chart_version' values-${{parameters.environment}}.yaml)
+          RELEASE_NAME=$(yq '.release_name'  values-${{parameters.environment}}.yaml)
+          POD_NAME="$(yq '.product' values-${{parameters.environment}}.yaml)-$(yq '.application' values-${{parameters.environment}}.yaml)-$(yq '.role' values-${{parameters.environment}}.yaml)"
+
+          echo "chart version: $CHART_VERSION"
+          echo "image version: $IMAGE_VERSION"
+          echo "image name: $IMAGE_NAME"
+          echo "release name: $RELEASE_NAME"
+          echo "pod name: $POD_NAME"
+          echo "acr : $(acr)"
+
+          echo "##vso[task.setvariable variable=imageversion;isOutput=true]$IMAGE_VERSION"
+          echo "##vso[task.setvariable variable=chartversion;isOutput=true]$CHART_VERSION"
+          echo "##vso[task.setvariable variable=imagename;isOutput=true]$IMAGE_NAME"
+          echo "##vso[task.setvariable variable=releasename;isOutput=true]$RELEASE_NAME"
+          echo "##vso[task.setvariable variable=podname;isOutput=true]$POD_NAME"
+
+        displayName: 'get version(linux)'
+        name: defineversion
+        condition: eq(variables['Agent.OS'],'Linux') 
+    #https://github.com/docker/buildx/releases/download/v0.30.1/buildx-v0.30.1.linux-arm64
+
+    # https://download.docker.com/linux/static/stable/armel/ old processor 32 bit
+    # https://download.docker.com/linux/static/stable/armhf/ new process 64 bits
+    # https://download.docker.com/linux/static/stable/x86_64/ amd64
+
+    # https://download.docker.com/linux/static/stable/armhf/docker-29.1.5.tgz 
+    # https://download.docker.com/linux/static/stable/x86_64/docker-29.1.5.tgz
+
+    # https://github.com/docker/buildx/releases/download/v0.30.1/buildx-v0.30.1.linux-arm64 
+    # https://github.com/docker/buildx/releases/download/v0.30.1/buildx-v0.30.1.linux-amd64
+
+    # curl -LO  https://download.docker.com/linux/static/stable/armhf/docker-29.1.5.tgz -o /root
+    # tar xzvf docker-29.1.5.tgz
+    #  mv docker/docker /usr/local/bin/ 
+    #  mkdir -p /root/.docker/cli-plugins
+    #  curl -SL https://github.com/docker/buildx/releases/download/v0.30.1/buildx-v0.30.1.linux-arm64 -o /root/.docker/cli-plugins/docker-buildx 
+    # chmod +x /root/.docker/cli-plugins/docker-buildx
+    # docker buildx create   --name remote-buildkit --driver remote  tcp://buildkitd.default.svc.cluster.local:1234
+    # docker buildx install
+    # docker buildx use remote-buildkit
+
+    # docker buildx rm remote-buildkit to remove   
+      - task: AzureCLI@2
+        name: buildpublishdocker
+        displayName: 'build&publish image'
+        inputs:
+          azureSubscription: 'azure-devops-kubernetes-${{parameters.project}}-${{parameters.environment}}'  # Name of your Azure service connection
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            #!/bin/bash
+            set -e +H
+            # -e to exit on error
+            # +H to prevent history expansion
+            # Set the script's locale to UTF-8 to ensure proper handling of UTF-8 encoded text
+            export LANG=C.UTF-8
+            docker build -f Dockerfile.${{ parameters.architecture}}  -t $(acr).azurecr.io/$(defineversion.imagename).${{ parameters.architecture}}:$(defineversion.imageversion)  .
+
+            echo "Logging in to ACR..."
+            #az acr login --name $(acr)
+
+            az account set --subscription $(subscription)
+
+
+            TOKEN=$(az acr login -n $(acr)  --expose-token -o tsv --query accessToken)
+            ACR=$(az acr show -n $(acr)  --query loginServer -o tsv)
+
+            echo "acr : $ACR"
+
+            echo "$TOKEN" | docker login $ACR \
+                -u 00000000-0000-0000-0000-000000000000 \
+                --password-stdin
+            
+            echo "publishign image"
+            docker build --push -f Dockerfile.${{ parameters.architecture}} -t $ACR/$(defineversion.imagename).${{ parameters.architecture}}:$(defineversion.imageversion) .
+
+      - task: AzureCLI@2
+        name: deployhelm
+        displayName: 'publish helm'
+        inputs:
+          azureSubscription: 'azure-devops-kubernetes-${{parameters.project}}-${{parameters.environment}}'  # Name of your Azure service connection
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            #!/bin/bash
+            set -e +H
+            # -e to exit on error
+            # +H to prevent history expansion
+            # Set the script's locale to UTF-8 to ensure proper handling of UTF-8 encoded text
+            export LANG=C.UTF-8
+            
+            #az aks install-cli --kubelogin-version 0.2.9 --client-version 1.33.2
+            az aks install-cli
+
+            echo "login to the acr"
+            #az acr login --name $(acr)
+
+            az account set --subscription $(subscription)
+
+            TOKEN=$(az acr login -n $(acr)  --expose-token -o tsv --query accessToken)
+            ACR=$(az acr show -n $(acr)  --query loginServer -o tsv)
+
+            echo "acr : $ACR"
+
+            echo "$TOKEN" | docker login $ACR \
+                -u 00000000-0000-0000-0000-000000000000 \
+                --password-stdin
+
+            kubelogin --version
+            kubectl version --client=true
+          
+            #this require reader role at subcription level 
+            #this require two roles 
+            #Azure Kubernetes Service Cluster Admin Role
+            #Azure Kubernetes Service RBAC Cluster Admin
+            #Azure Kubernetes Service RBAC Admin cannot be because cant create namespaces
+
+            az aks get-credentials --resource-group $(aksrg) --name $(aksname) --overwrite-existing
+            kubelogin convert-kubeconfig -l azurecli
+            kubectl get ns 
+            echo "------------------------------"
+            
+            #The --atomic flag in Helm (used with helm install or helm upgrade) ensures that if a release fails
+            echo "chart release name: $(defineversion.releasename)"
+            echo "chart version : $(defineversion.chartversion)"
+
+            helm upgrade --install --force --wait --atomic --timeout 10m  $(defineversion.releasename) oci://$ACR/helm/deployment \
+            --version $(defineversion.chartversion) -f values-${{parameters.environment}}.yaml  \
+            --set app.image.repository=$(acr).azurecr.io/$(defineversion.imagename).${{ parameters.architecture}} \
+            --set app.image.tag=$(defineversion.imageversion) \
+            --namespace $(namespace) --create-namespace

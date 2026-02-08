@@ -1,0 +1,199 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+parameters:
+- name: modules
+  default: '' 
+- name: environment
+  default: ''
+- name: organization
+  default: ''
+- name: project
+  default: ''
+- name: repository
+  default: ''
+- name: longstring
+  default: ''
+- name: runnerobjectid  
+  default: ''
+steps:
+  - script: |
+      git config --system --unset-all http.extraheader || true
+      git config --global --unset-all http.extraheader || true
+      git config --unset-all http.extraheader || true
+    displayName: 'cleanup credentials on runners'
+  - checkout: self
+    clean: true
+    persistCredentials: true
+    fetchDepth: 0
+  - task: AzureKeyVault@2
+    inputs:
+      azureSubscription: 'azure-devops-${{parameters.project}}-${{parameters.environment}}'
+      KeyVaultName: '$(keyvault_backend)'
+      SecretsFilter: '*' # or a comma-separated list of secret names
+    displayName: 'Fetch Secrets from Azure Key Vault'
+    # Subsequent tasks can use the secrets as variables, e.g., $(mySecretName)
+  - bash: |
+      ls -ls
+      echo "Modules JSON: ${{ parameters.modules }}"   # compile-time string
+      echo "longstring: ${{ parameters.longstring }}" #variable in secret variable group
+
+      #variable in secret variable group
+      status="$(continue)"
+      echo "current status: $status"
+
+      if [[ "$status" == "true" || "$status" == "True" ]]; then
+        echo "keep going"
+      else
+        echo "force failure"
+        exit 1
+      fi
+
+      cd ${{ parameters.modules }}
+      ls -ls
+      currentdir=$(basename "$PWD")
+      echo "current dir: ${currentdir}"
+      
+      firstpart=$( echo "${{ parameters.longstring }}" | awk -F",${currentdir}" '{print $1}' )
+      echo "first part: ${firstpart}"
+
+      lastpart=$(echo "${firstpart}" | awk -F"," '{print $NF}')
+      echo "last part: ${lastpart}"
+
+      #az aks install-cli --kubelogin-version 0.2.9 --client-version 1.33.2
+      az aks install-cli
+      
+      kubelogin --version
+      kubectl version --client=true
+
+      echo "##vso[task.setvariable variable=lastpart;isOutput=true]$lastpart"
+    name: lastname
+    displayName: "define last artifact name"
+
+  - download: current
+    artifact:  $(lastname.lastpart)
+    displayName: "download last status artifact"
+   # continueOnError: true 
+
+  - task: TerraformInstaller@1
+    inputs:
+      terraformVersion: 'latest' # Or a specific version like '1.5.7'
+#https://learn.microsoft.com/en-us/azure/devops/pipelines/process/run-number?view=azure-devops
+#https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables?view=azure-devops&tabs=yaml
+  - script: |
+      #!/bin/bash
+      set -e +H
+      # -e to exit on error
+      # +H to prevent history expansion
+      # Set the script's locale to UTF-8 to ensure proper handling of UTF-8 encoded text
+      export LANG=C.UTF-8
+
+      #variable in secret variable group
+      status="$(continue)"
+      echo "current status: $status"
+
+      if [[ "$status" == "true" || "$status" == "True" ]]; then
+        echo "keep going"
+      else
+        echo "force failure"
+        exit 1
+      fi
+
+      curl -sS -H "Authorization: Bearer $(System.AccessToken)" https://dev.azure.com/${{ parameters.organization }}/_apis/connectionData?api-version=7.1-preview.1 > auth.json
+          
+      echo "Organization: ${{ parameters.organization }}"
+      echo "Project: ${{ parameters.project }}"
+      echo "Repository: ${{ parameters.repository }}"
+      echo "current agent status: $(Agent.JobStatus)"
+
+      laststepdeploystatus=$(cat $(Pipeline.Workspace)/$(lastname.lastpart)/status.txt)
+      echo "last status file: ${laststepdeploystatus}"
+      echo "##vso[task.setvariable variable=laststatus;isOutput=true]${laststepdeploystatus}"
+
+      authenticated_user=$(cat auth.json | jq -r '.authenticatedUser.customDisplayName')
+      authenticated_subject_id=$(cat auth.json | jq -r '.authenticatedUser.subjectDescriptor')
+      authenticated_user_id=$(cat auth.json | jq -r '.authenticatedUser.id')
+
+      echo "-----------------------------------------------"
+      echo "buildid : $(Build.BuildId)"
+      echo "authenticated user: $authenticated_user"
+      echo "authenticated subject_id: $authenticated_subject_id"
+      echo "authenticated user id: $authenticated_user_id"
+      echo "-----------------------------------------------"
+      git config --global http.extraheader "AUTHORIZATION: bearer $(System.AccessToken)"
+
+      ls -ls
+      echo "Modules JSON: ${{ parameters.modules }}"   # compile-time string
+      cd ${{ parameters.modules }}
+      ls -ls
+      currentdir=$(basename "$PWD")
+      echo "current dir: ${currentdir}"
+      echo "##vso[task.setvariable variable=currentfolder;isOutput=true]$currentdir"
+    name: configuressh
+    displayName: "set success conditional"
+
+    #condition: and(succeeded(), contains(variables['setvariable.laststatus'], 'Succeeded')) #ne(variables['laststatus'], 'Failed')
+
+#    az keyvault secret set --vault-name "YourKeyVaultName" --name "YourSecretName" --file "path/to/your/file.txt"
+
+  - task: AzureCLI@2
+    displayName: 'Terraform init and validate'
+    condition: and(succeeded(), contains(variables['configuressh.laststatus'], 'Succeeded')) # ne(variables['laststatus'], 'Failed')
+    inputs:
+      azureSubscription: 'azure-devops-${{parameters.project}}-${{parameters.environment}}' #the app reg associated to it require storage blob data contributor
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        git config --global http.extraheader "AUTHORIZATION: bearer $(System.AccessToken)"
+        cd $(System.DefaultWorkingDirectory)/${{ parameters.modules }}
+        terraform init -input=false `
+          -backend-config="storage_account_name=$(storageaccount_backend)" `
+          -backend-config="resource_group_name=$(resourcegroup_backend)"  `
+          -backend-config="container_name=tfstate" `
+          -backend-config="key=${{ parameters.environment }}/${{parameters.project}}/$(configuressh.currentfolder)/terraform.tfstate"
+        echo "-----------------------------------------------"
+        echo "validate step"
+        echo "-----------------------------------------------"
+
+        terraform validate -no-color 
+
+#with tf variables you can make some error dissapears https://medium.com/@sampark02/6-ways-to-pass-values-to-variables-in-terraform-with-real-examples-f70b92fdc8a4
+  - task: AzureCLI@2
+    displayName: 'Terraform destroy'
+    condition: and(succeeded(), contains(variables['configuressh.laststatus'], 'Succeeded')) # ne(variables['laststatus'], 'Failed')
+    inputs:
+      azureSubscription: 'azure-devops-${{parameters.project}}-${{parameters.environment}}' #the app reg associated to it require storage blob data contributor
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        git config --global http.extraheader "AUTHORIZATION: bearer $(System.AccessToken)"
+        $env:ARM_SUBSCRIPTION_ID="$(subscriptionId)"
+        $env:TF_VAR_azure_organization="${{ parameters.organization }}"
+        $env:TF_VAR_azure_project="${{ parameters.project }}"
+        $env:TF_VAR_azure_repository="${{ parameters.repository }}"
+        $env:TF_VAR_runner_objectid="${{ parameters.runnerobjectid }}"
+        $env:TF_VAR_subscription_name="${{ parameters.environment }}"
+
+        cd $(System.DefaultWorkingDirectory)/${{ parameters.modules }}
+        terraform destroy -no-color -input=false -auto-approve -var-file="../dev.tfvars" 
+        #-var azure_organization="${{ parameters.organization }}" -var azure_project="${{ parameters.project }}" -var azure_repository="${{ parameters.repository }}"
+
+
+  - bash: |
+      echo -n "$(Agent.JobStatus)" > status.txt
+    displayName: set status on file
+    condition: true
+
+
+  - bash: |
+      echo -n "Failed" > status.txt
+    displayName: set status on file
+    condition: contains(variables['configuressh.laststatus'], 'Failed') # eq(variables['laststatus'], 'Failed')
+
+
+  - publish: status.txt
+    artifact: $(configuressh.currentfolder)
+    displayName: save current status on file
+    condition: true

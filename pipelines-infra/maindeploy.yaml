@@ -1,0 +1,150 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+parameters:
+- name: environment
+  displayName: 'environment'
+  values:
+    - ENVNAMES
+- name: mode
+  displayName: 'mode'
+  default: test
+  values:
+  - test
+  - deploy
+- name: agentPool
+  type: string
+  default: 'aks pool'
+  values:
+  - Azure Pipelines #default one
+  - aks pool
+trigger: none
+#cannot use on runtime , #(AGENT_POOL) variable group 
+#this need to be paramater which is compile time
+#at this scope need to be hardcoded cannot be parameterized, movingthis inside stages
+# pool:
+#   name: ${{ parameters.agentPool }}
+variables:
+#  - name: System.Debug
+#    value: true
+  - group: "infra-PROJECTNAME-${{ parameters.environment }}"
+  - group: "automation-PROJECTNAME"
+
+#  - group: ${{ parameters.environment }}-infra-keyvault
+stages:
+- stage: discovery_stage
+  jobs:
+  - deployment: deploy
+    displayName: intro step
+    environment: ${{ parameters.environment }}
+    pool:
+      name: ${{ parameters.agentPool }}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              git config --system --unset-all http.extraheader || true
+              git config --global --unset-all http.extraheader || true
+              git config --unset-all http.extraheader || true
+            displayName: 'cleanup credentials on runners'
+          - checkout: self
+  - job: Setup
+    #add the app reg used in the self hosted runner inside of the [project]\Contributors to allow him to clone or it will say 400 unauthorized
+    pool:
+      name: ${{ parameters.agentPool }}
+    steps:
+    # - script: |
+    #     modules=$(find $(terraform-working-directory) -maxdepth 1 -type d -not -path '*/${{ parameters.environment }}')
+    #     echo "$modules"
+    #     #modules_json=$(printf '%s\n' $modules | jq -R . | jq -s -c .)
+    #     #modules_json=$(jq -cRn --arg str "$modules" '($str | split(" "))')
+    #     modules_json=$(echo $modules | tr ' ' ',')
+    #     echo "$modules_json"
+    #     echo "##vso[task.setvariable variable=modules;isOutput=true]$modules_json"
+    #   name: setModules
+    # - script: |
+    #     echo "Modules: $(setModules.modules)"
+    #     echo "$(setModules.modules)" > modules.json
+    #   name: saveModules
+    #- publish: modules.json
+    #  artifact: modules
+    - script: |
+        git config --system --unset-all http.extraheader || true
+        git config --global --unset-all http.extraheader || true
+        git config --unset-all http.extraheader || true
+      displayName: 'cleanup credentials on runners'
+    - checkout: self
+      clean: true
+      persistCredentials: true
+      fetchDepth: 0
+    - task: PowerShell@2
+      displayName: 'discover folders'
+      name: discover_folders
+      inputs:
+        targetType: filePath
+        filePath: $(System.DefaultWorkingDirectory)/discover.ps1
+        arguments: -workingDirectory $(System.DefaultWorkingDirectory)
+
+    - script: |
+        echo "Org URL: $(System.TeamFoundationCollectionUri)"
+        echo "Project: $(System.TeamProject)"
+        echo "Repository: $(Build.Repository.Name)"
+        echo "Repo URL: $(Build.Repository.Uri)"
+        echo "longstring: $(discover_folders.longstring)"
+        echo "complexmodule: $(discover_folders.complexmodule)"
+        echo "runner objectid: $(runner_objectid)"
+
+        # Extract org name from URL (bash example)
+        ORG_NAME=$(echo $(System.TeamFoundationCollectionUri) | cut -d'/' -f4)
+        echo "Organization: $ORG_NAME"
+        echo "##vso[task.setvariable variable=organization;isOutput=true]$ORG_NAME"
+        echo "##vso[task.setvariable variable=project;isOutput=true]$(System.TeamProject)"
+        echo "##vso[task.setvariable variable=repository;isOutput=true]$(Build.Repository.Name)"
+        echo "##vso[task.setvariable variable=runnerobjectid;isOutput=true]$(runner_objectid)"
+      name: reposettings
+      displayName: "Show Org , Project and repo"
+
+    - bash: |
+        echo -n "$(Agent.JobStatus)" > status.txt
+      displayName: set status on file
+
+    - publish: status.txt
+      artifact: status
+      displayName: set initial status
+
+  - job: Execute
+    #add the app reg used in the self hosted runner inside of the [project]\Contributors to allow him to clone or it will say 400 unauthorized
+    pool:
+      name: ${{ parameters.agentPool }}
+    dependsOn:
+    - Setup
+    variables:
+      organization: $[ dependencies.Setup.outputs['reposettings.organization'] ]
+      project: $[ dependencies.Setup.outputs['reposettings.project'] ]
+      repository: $[ dependencies.Setup.outputs['reposettings.repository'] ]
+      longstring:  $[ dependencies.Setup.outputs['discover_folders.longstring'] ]
+      runnerobjectid:  $[ dependencies.Setup.outputs['reposettings.runnerobjectid'] ]
+      #https://docs.github.com/es/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations
+      #https://gist.github.com/kiweezi/6c43eac02327fa667a05115e45d59f85
+      #https://github.com/microsoft/azure-pipelines-tasks/issues/12718
+      #https://learn.microsoft.com/en-us/azure/devops/pipelines/yaml-schema/jobs-job-strategy?view=azure-pipelines
+      #https://learn.microsoft.com/en-us/rest/api/azure/devops/build/builds/update-build?view=azure-devops-rest-7.2#buildresult
+    strategy:
+      maxParallel: 1
+      #failfast: true
+      matrix:  $[ dependencies.Setup.outputs['discover_folders.complexmodule'] ]
+ 
+    steps:
+    - template: deploy.yaml
+      parameters:
+        modules: $(modules)
+        environment: ${{ parameters.environment }}
+        organization: $(organization)
+        project: $(System.TeamProject)
+        repository: $(repository)
+        longstring:  $(longstring)
+        runnerobjectid: $(runner_objectid)
+    condition: and(eq('${{ parameters.mode }}', 'deploy'),eq(variables['continue'], 'true'))

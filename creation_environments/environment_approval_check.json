@@ -1,0 +1,19 @@
+{
+    "type": {
+      "name": "Approval"
+    },
+    "settings": {
+      "approvers": [
+        {
+          "id": "GROUP_ID_DESCRIPTOR",
+          "type": "group"
+        }
+      ],
+      "minimumApproverCount": 1,
+      "requesterCannotBeApprover": false
+    },
+    "resource": {
+      "type": "environment",
+      "id": "ENV_ID"
+    }
+  }

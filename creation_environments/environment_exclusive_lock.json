@@ -1,0 +1,12 @@
+{
+    "type": {
+        "name": "ExclusiveLock"
+    },
+    "settings": {
+        "lockType": "runLatest"
+    },
+    "resource": {
+        "type": "environment",
+        "id": "ENV_ID"
+    }
+}

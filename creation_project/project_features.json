@@ -1,0 +1,13 @@
+{
+    "featureIds": [
+        "ms.vss-work.agile",
+        "ms.vss-code.version-control",
+        "ms.vss-build.pipelines",
+        "ms.vss-test-web.test",
+        "ms.feed.feed"
+    ],
+    "featureStates": {},
+    "scopeValues": {
+        "project": "PROJECT_ID"
+    }
+}

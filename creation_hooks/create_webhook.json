@@ -1,0 +1,23 @@
+{
+    "consumerActionId": "enqueue",
+    "consumerId": "azureStorageQueue",
+    "consumerInputs": {
+        "accountName": "AZ_DEVOPS_STORAGE_ACCOUNT",
+        "accountKey": "AZ_DEVOPS_ACCESS_KEY",
+        "queueName": "AZ_DEVOPS_QUEUE_NAME",
+        "visiTimeout": "0",
+        "ttl": "3600"
+    },
+    "eventType": "ms.vss-pipelines.job-state-changed-event",
+    "publisherId": "pipelines",
+    "publisherInputs": {
+        "pipelineId": "",
+        "stageNameId": "",
+        "jobNameId": "",
+        "jobStateId": "",
+        "jobResultId": "",
+        "projectId": "AZ_PROJECT_ID"
+    },
+    "resourceVersion": "5.1-preview.1",
+    "scope": 1
+}

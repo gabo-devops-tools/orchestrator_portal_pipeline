@@ -1,0 +1,1092 @@
+name: create-projects-azure-devops
+trigger: none
+pr: none
+
+#each subscription used in the pipeline will for automation will have  a full resource id for storage account, for vault 
+parameters:
+  - name: payload
+    type: string
+    default: placeholder
+  - name: agentPool
+    type: string
+    default: "aks pool"
+    values:
+      - Azure Pipelines #default one
+      - FILLME
+  - name: automation_principal
+    displayName: automation service principal
+    type: string
+    default: FILLME #need to be configured previously
+variables:
+  - group: FILLME
+  - name: terraform_module_repo
+    value: FILLME
+  - name: terraform_module_project
+    value: FILLME
+  - name: storage_account_queue
+    value: FILLME
+  - name: function_app
+    value:  FILLME
+  - name: azdevops_queuename
+    value: FILLME
+  - name: short_sleep
+    value: 2
+  - name: long_sleep
+    value: 30
+
+#https://learn.microsoft.com/es-es/azure/devops/pipelines/agents/hosted?view=azure-devops&tabs=macos-images%2Cyaml
+#pool:
+#  vmImage: 'ubuntu-latest' #ubuntu-latest #macOS-latest
+
+#cannot use on runtime , #(AGENT_POOL) variable group
+#this need to be paramater which is compile time
+#at this scope need to be hardcoded cannot be parameterized, movingthis inside stages
+# pool:
+#   name: ${{ parameters.agentPool }}
+#https://developercommunity.visualstudio.com/t/unable-to-use-systemaccesstoken-to-clone-git-repo/1683026
+
+stages:
+  - stage: run_pipeline
+    jobs:
+      - job: validate
+        pool:
+          name: ${{ parameters.agentPool }}
+        steps:
+          #add the app reg used in the self hosted runner inside of the [project]\Contributors to allow him to clone or it will say 400 unauthorized
+          - script: |
+              #!/bin/bash
+              set -e +H
+              # -e to exit on error
+              # +H to prevent history expansion
+              # Set the script's locale to UTF-8 to ensure proper handling of UTF-8 encoded text
+              export LANG=C.UTF-8
+
+              project_name=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Options' | jq -r '.Project_name' )
+              echo "##vso[build.addbuildtag]$project_name"
+              git config --system --unset-all http.extraheader || true
+              git config --global --unset-all http.extraheader || true
+              git config --unset-all http.extraheader || true
+            displayName: "cleanup credentials on runners"
+          - checkout: self
+            clean: true
+            persistCredentials: true
+            fetchDepth: 0
+
+          # add automation_principal to [ORG]\Project Collection Build Service Accounts
+          #this need to be a AzureCLI@2 task or we will have error
+          #ERROR: Before you can run Azure DevOps commands, you need to run the login command(az login if using AAD/MSA identity else az devops login if using PAT token) to setup credentials.  Please see https://aka.ms/azure-devops-cli-auth for more information.
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: ${{ parameters.automation_principal }} # Name of your Azure service connection
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                #!/bin/bash
+                set -e +H
+                # -e to exit on error
+                # +H to prevent history expansion
+                # Set the script's locale to UTF-8 to ensure proper handling of UTF-8 encoded text
+                export LANG=C.UTF-8
+                ORG_NAME=$(echo $(System.TeamFoundationCollectionUri) | cut -d'/' -f4)
+
+                az devops configure --defaults organization=$(System.CollectionUri)
+                az devops project list -o table
+
+                #if we use the az devops cli command all the azure devops command in here will be executed as the user logged called ${{ parameters.automation_principal }}
+
+                project_name=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Options' | jq -r '.Project_name' )
+
+                curl -sS -H "Authorization: Bearer $(System.AccessToken)" $(System.CollectionUri)_apis/connectionData?api-version=7.1-preview.1 > auth.json
+                sleep $(short_sleep)   
+                authenticated_user=$(cat auth.json | jq -r '.authenticatedUser.customDisplayName')
+                authenticated_subject_id=$(cat auth.json | jq -r '.authenticatedUser.subjectDescriptor')
+                authenticated_user_id=$(cat auth.json | jq -r '.authenticatedUser.id')
+
+                #in case project doesnt exists to exit with success
+                az devops project show --project $project_name > project_data.json || true
+                sleep $(short_sleep)
+                old_project_id=$( cat project_data.json | jq -r '.id')
+                description=$(cat project_data.json | jq -r '.description')
+
+                service_connections_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.ServiceConnections')
+                subscriptions_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Subscriptions')
+                vargroups_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Variablegroups')
+
+                recreate_project=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Options'  | jq -r '.Recreate_project' | tr '[:upper:]' '[:lower:]')
+
+
+                echo "-----------------------------------------------"
+                echo "project: $project_name"
+                echo "old description: $description"
+                echo "old project id: $old_project_id"
+                echo "organization id: $(System.CollectionId)"
+                echo "organization uri: $(System.CollectionUri)"
+                echo "build request for: $(Build.RequestedFor)"
+                echo "build request for id: $(Build.RequestedForId)"
+                echo "authenticated user: $authenticated_user"
+                echo "authenticated subject_id: $authenticated_subject_id"
+                echo "authenticated user id: $authenticated_user_id"
+                echo "recreate project: $recreate_project"
+                echo "subscription_names: "
+                echo "${{parameters.payload}}" | base64 --decode | jq '.Subscriptions'
+                echo "service_connections: "
+                echo "${{parameters.payload}}" | base64 --decode | jq '.ServiceConnections'
+                echo "variable_groups: "
+                echo "${{parameters.payload}}" | base64 --decode | jq '.Variablegroups'
+                echo "required_repos: "
+                echo "${{parameters.payload}}" | base64 --decode | jq '.Requiredrepos'
+                echo "options: "
+                echo "${{parameters.payload}}" | base64 --decode | jq '.Options'
+                echo "-----------------------------------------------"
+
+
+                terraform_module_repo_descriptor=$(az devops security group list  --project  $(terraform_module_project)  | jq -r  ' .graphGroups| .[] | select(.displayName == "Project Administrators") | .descriptor')
+                echo "terraform module repo descriptor: $terraform_module_repo_descriptor"
+                sleep $(short_sleep)
+
+
+                if [[ "$description" == "managed by orchestrator" && "$recreate_project" == "true"  ]]; then
+                    echo "-----------------------------------------------"
+                    echo "remove old cross reference for terraform modules repos"
+                    echo "-----------------------------------------------"  
+
+                    #https://learn.microsoft.com/en-us/rest/api/azure/devops/graph/users/list?view=azure-devops-rest-7.1&tabs=HTTP
+                    #can give also azure devops build services used in pipelines
+
+                    curl -Ss -H "Authorization: Bearer $(System.AccessToken)" \
+                        -XGET https://vssps.dev.azure.com/$ORG_NAME/_apis/graph/users  > remote_repos_services.json
+                    REMOTE_BUILD_SERVICE=$(cat remote_repos_services.json  | jq -r ".value[] | select ( .displayName | contains(\"$project_name Build Service\")).descriptor" )
+                    echo "remote repo build service descriptor: $REMOTE_BUILD_SERVICE"
+                    echo ""
+                    sleep $(short_sleep)
+
+                    # to force pipeline to continue pipeline if group menbership doesnt exists
+
+                    echo "remove $project_name Build Service ($ORG_NAME) from $(terraform_module_project) Project Administrators"
+                    removing=$(az devops security group membership remove \
+                      --group-id $terraform_module_repo_descriptor \
+                      --member-id $REMOTE_BUILD_SERVICE --yes || true)
+                    sleep $(short_sleep)
+                    echo "-----------------------------------------------"
+                    echo "removing project"
+                    echo "-----------------------------------------------"  
+                    az devops project delete --id $old_project_id --yes
+                    sleep $(short_sleep)
+                fi
+
+                az devops project create \
+                  --description "managed by orchestrator" \
+                  --name $project_name \
+                  --visibility private \
+                  --process Agile || true
+                sleep $(short_sleep)
+
+                # validate connection
+                PROJECT_ID=$(az devops project list -o json | jq -r ".value[] | select(.name == \"$project_name\") | .id" )
+                sleep $(short_sleep)
+
+                #this variable is used in the other part of the pipeline, dont remove it 
+                echo "##vso[task.setvariable variable=project_id;isOutput=true]$PROJECT_ID"
+
+                #https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables?view=azure-devops&tabs=yaml
+                echo "-----------------------------------------------"
+                echo "remote project_id : $PROJECT_ID"
+                echo "local project_id : $(System.TeamProjectId)"
+                echo "local project name : $(System.TeamProject)"
+
+                #https://learn.microsoft.com/en-us/javascript/api/azure-devops-extension-api/featuremanagementrestclient#azure-devops-extension-api-featuremanagementrestclient-setfeaturestateforscope
+                #https://github.com/microsoft/azure-devops-extension-api/blob/master/src/FeatureManagement/FeatureManagementClient.ts
+
+                #this is be extreme important to let know the az cli we going to work in the new project namespace
+                az devops configure --defaults organization=$(System.CollectionUri) project=$project_name 
+                sleep $(short_sleep)
+
+                group_remote_projectadmin_descriptor=$(az devops security group list --project $project_name  | jq -r  ' .graphGroups| .[] | select(.displayName == "Project Administrators") | .descriptor')
+                sleep $(short_sleep)
+                group_local_projectadmin_descriptor=$(az devops security group list --project  $(System.TeamProject)  | jq -r  ' .graphGroups| .[] | select(.displayName == "Project Administrators") | .descriptor')
+                sleep $(short_sleep)
+                group_remote_contributor_descriptor=$(az devops security group list --project $project_name  | jq -r  ' .graphGroups| .[] | select(.displayName == "Contributors") | .descriptor')
+                sleep $(short_sleep)
+
+                serviceprincipal_descriptor=$(az devops user list   --organization $(System.CollectionUri) -o json | jq -r '.members[] | select(.user.displayName=="${{ parameters.automation_principal }}") | .user.descriptor')
+                sleep $(short_sleep)
+
+                echo "group ids" 
+                echo "-----------------------------------------------"
+                echo "projectadmin group descriptor: $group_remote_projectadmin_descriptor"
+                echo "local projectadmin descriptor: $group_local_projectadmin_descriptor"
+                echo "contributor descriptor: $group_remote_contributor_descriptor"
+                echo "users ids" 
+                echo "-----------------------------------------------"
+                echo "service principal descriptor: $serviceprincipal_descriptor"
+
+                echo "-----------------------------------------------"
+                # we need to add the user sp ${{ parameters.automation_principal }} into [ORG]\Project Collection Administrators
+
+                echo "adding sp ${{ parameters.automation_principal }} to $project_name Project Administrators"
+                adding=$(az devops security group membership add \
+                  --group-id $group_remote_projectadmin_descriptor \
+                  --member-id $serviceprincipal_descriptor) 
+                sleep $(short_sleep)
+
+
+                echo "adding sp $authenticated_user to $project_name Project Administrators"
+                adding=$(az devops security group membership add \
+                  --group-id $group_remote_projectadmin_descriptor \
+                  --member-id $authenticated_subject_id)
+                sleep $(short_sleep)
+
+                GIT_NAMESPACE_ID=$(az devops security permission namespace list \
+                  --query "[?name=='Git Repositories'].namespaceId | [0]" \
+                  -o tsv)
+                sleep $(short_sleep)
+
+                SECURITY_NAMESPACE_ID=$(az devops security permission namespace list \
+                  --query "[?name=='Security'].namespaceId | [0]" \
+                  -o tsv)
+                sleep $(short_sleep)
+
+                #https://learn.microsoft.com/en-us/azure/devops/organizations/security/namespace-reference?view=azure-devops
+                echo "-----------------------------------------------"
+                echo "git namespace_id: $GIT_NAMESPACE_ID"
+                echo "security namespace_id: $SECURITY_NAMESPACE_ID"
+                echo "-----------------------------------------------"
+
+                #allow bit for create repo 256
+                #allow bit to read 2 
+                #allow bit to contribute 4
+                #allow bit to create branch 16
+                #final number 278
+
+                #this permission is only to allow this project to clone the new empty created project and bootstrap the code and infra repos used in the next step
+
+                echo "adding local project admin group to remote project in git namespace"
+                adding=$(az devops security permission update \
+                  --id "$GIT_NAMESPACE_ID" \
+                  --subject "$group_local_projectadmin_descriptor" \
+                  --token "repoV2/$PROJECT_ID" \
+                  --allow-bit 278 )
+                sleep $(short_sleep)
+
+                # we need to add the user sp ${{ parameters.automation_principal }} into [ORG]\Project Collection Administrators
+                # final solution was to set at organization level pipelines >> settings >> Limit job authorization scope to current project for non-release pipelines to off
+                # final solution was to set at organization level pipelines >> settings >> Protect access to repositories in YAML pipelines to off
+
+
+                echo "adding $authenticated_user to remote project in git namespace"
+                adding=$(az devops security permission update \
+                   --id "$GIT_NAMESPACE_ID" \
+                   --subject "$authenticated_subject_id" \
+                   --token "repoV2/$PROJECT_ID" \
+                   --allow-bit 278)
+                sleep $(short_sleep)
+
+                #this is always 1
+                # echo "adding $authenticated_user to remote project in security namespace"
+                # adding=$(az devops security permission update \
+                #    --id "$SECURITY_NAMESPACE_ID" \
+                #    --subject "$authenticated_subject_id" \
+                #    --token "repoV2/$PROJECT_ID" \
+                #    --allow-bit 1)
+                # sleep $(short_sleep)
+
+                #this two command require that user attached to $(System.AccessToken) have permission to edit properties on their configuration (the buidld service not the app reg)
+                echo "-----------------------------------------------"
+                echo "disable azure tests"
+                echo "-----------------------------------------------"  
+                curl -Ss -H "Authorization: Bearer $(System.AccessToken)" -H "Content-Type: application/json" \
+                   --data @creation_project/disable_azure_test.json \
+                   -XPATCH $(System.CollectionUri)_apis/FeatureManagement/FeatureStates/host/project/$PROJECT_ID/ms.vss-test-web.test?api-version=7.2-preview.1 
+                sleep $(short_sleep)
+                echo ""
+
+                echo "-----------------------------------------------"
+                echo "disable azure board"
+                echo "-----------------------------------------------"  
+                curl -Ss -H "Authorization: Bearer $(System.AccessToken)" -H "Content-Type: application/json" \
+                   --data @creation_project/disable_azure_board.json \
+                   -XPATCH $(System.CollectionUri)_apis/FeatureManagement/FeatureStates/host/project/$PROJECT_ID/ms.vss-work.agile?api-version=7.2-preview.1 
+                 sleep $(short_sleep)
+                echo ""
+
+                echo "-----------------------------------------------"
+                echo "disable Protect access to repositories in YAML pipelines"
+                echo "-----------------------------------------------"  
+
+                #this is the permission modification that require us to  add users in  security namespace"
+                #https://learn.microsoft.com/en-us/rest/api/azure/devops/build/general-settings/get?view=azure-devops-rest-7.1
+                #https://learn.microsoft.com/en-us/rest/api/azure/devops/build/general-settings/update?view=azure-devops-rest-7.1
+
+                curl -Ss -H "Authorization: Bearer $(System.AccessToken)" -H "Content-Type: application/json" \
+                   --data @creation_project/disable_yaml_restriction.json \
+                   -XPATCH $(System.CollectionUri)$PROJECT_ID/_apis/build/generalsettings?api-version=7.1   
+                sleep $(short_sleep)
+
+                echo ""
+                echo "-----------------------------------------------"
+                echo "configure cross reference for terraform modules repos"
+                echo "-----------------------------------------------"  
+
+                #https://learn.microsoft.com/en-us/rest/api/azure/devops/graph/users/list?view=azure-devops-rest-7.1&tabs=HTTP
+                #can give also azure devops build services used in pipelines
+                curl -Ss -H "Authorization: Bearer $(System.AccessToken)" \
+                   -XGET https://vssps.dev.azure.com/$ORG_NAME/_apis/graph/users  > remote_repos_services.json
+                sleep $(short_sleep)
+
+                REMOTE_BUILD_SERVICE=$(cat remote_repos_services.json  | jq -r ".value[] | select ( .displayName | contains(\"$project_name Build Service\")).descriptor" )
+                echo "remote repo build service descriptor: $REMOTE_BUILD_SERVICE"
+                echo ""
+
+                # we need to add the user sp ${{ parameters.automation_principal }} into [ORG]\Project Collection Administrators
+
+                echo "add $project_name Build Service ($ORG_NAME) to $(terraform_module_project) Project Administrators"
+                az devops security group membership add \
+                  --group-id $terraform_module_repo_descriptor \
+                  --member-id $REMOTE_BUILD_SERVICE
+                sleep $(short_sleep)
+
+                echo "add $project_name Build Service ($ORG_NAME) to $project_name Project Administrators"
+                az devops security group membership add \
+                  --group-id $group_remote_projectadmin_descriptor \
+                  --member-id $REMOTE_BUILD_SERVICE
+                sleep $(short_sleep)
+
+                echo "-----------------------------------------------"
+                echo "creating queue webhook"
+                echo "-----------------------------------------------"
+
+                rg_queue=$(printf '%s\n' "$(storage_account_queue)" | awk -F/ '{for (i=1;i<=NF;i++) if ($i=="resourceGroups") print $(i+1)}')
+                storage_account_name_queue=$(printf '%s\n' "$(storage_account_queue)" | awk -F/ '{for (i=1;i<=NF;i++) if ($i=="storageAccounts") print $(i+1)}')
+
+                acceskey=$(az storage account keys list -g  $rg_queue  -n  $storage_account_name_queue  | jq -r '.[0].value')
+                echo ""
+                echo "project id: $PROJECT_ID"
+                echo "az resource group: $rg_queue"
+                echo "az devops storage account: $storage_account_name_queue"
+                echo "az devops queue name: $(azdevops_queuename)"
+                echo ""
+                sed -i "s#AZ_DEVOPS_STORAGE_ACCOUNT#$storage_account_name_queue#" creation_hooks/create_webhook.json creation_hooks/create_webhook_update.json
+                sed -i "s#AZ_DEVOPS_ACCESS_KEY#$acceskey#" creation_hooks/create_webhook.json creation_hooks/create_webhook_update.json
+                sed -i "s#AZ_DEVOPS_QUEUE_NAME#$(azdevops_queuename)#" creation_hooks/create_webhook.json creation_hooks/create_webhook_update.json
+                sed -i "s#AZ_PROJECT_ID#$PROJECT_ID#" creation_hooks/create_webhook.json creation_hooks/create_webhook_update.json
+
+                #GET https://dev.azure.com/{organization}/_apis/hooks/subscriptions?api-version=7.1
+
+                curl -Ss -H "Authorization: Bearer $(System.AccessToken)" -H "Content-Type: application/json" \
+                   -XGET  $(System.CollectionUri)_apis/hooks/subscriptions?api-version=7.1 > current_hooks.json
+                echo "current hooks"
+                echo "--------------------------------"
+
+                firstid_found=$(cat current_hooks.json | jq -r --arg pid "$PROJECT_ID" '.value | map(select( .publisherInputs.projectId == $pid )) | .[0].id')
+                tfs_subcription_id=$(cat current_hooks.json | jq -r --arg pid "$PROJECT_ID" '.value | map(select( .publisherInputs.projectId == $pid )) | .[0].publisherInputs.tfsSubscriptionId')
+
+                echo "first id found : $firstid_found"
+                echo "tfs subscription found : $tfs_subcription_id"
+
+                echo "--------------------------------"
+
+                if [[ -z "$firstid_found" || "$firstid_found" == "" || "$firstid_found" == "null"   ]]; then
+                  echo "no service hook found in this project, creating new"
+                  curl -Ss -H "Authorization: Bearer $(System.AccessToken)" -H "Content-Type: application/json" \
+                      --data @creation_hooks/create_webhook.json \
+                      -XPOST  $(System.CollectionUri)_apis/hooks/subscriptions?api-version=7.1
+                  echo ""
+                else
+                  echo " service hook found in this project, updating it"
+                  sed -i "s#AZ_SUBSCRIPTION_ID#$tfs_subcription_id#" creation_hooks/create_webhook_update.json
+                  sed -i "s#AZ_ID#$firstid_found#" creation_hooks/create_webhook_update.json
+
+                #https://learn.microsoft.com/en-us/rest/api/azure/devops/hooks/subscriptions/replace-subscription?view=azure-devops-rest-7.1&tabs=HTTP
+                  curl -Ss -H "Authorization: Bearer $(System.AccessToken)" -H "Content-Type: application/json" \
+                      --data @creation_hooks/create_webhook_update.json \
+                      -XPUT   $(System.CollectionUri)_apis/hooks/subscriptions/{firstid_found}?api-version=7.1
+                  echo ""          
+                fi
+
+                echo "--------------------------------"
+                echo "create variable group for automation"
+                echo "--------------------------------"
+
+                az pipelines variable-group create --name "automation-$project_name" \
+                    --variables continue=true \
+                    --authorize true  \
+                    --description "automation variables"  \
+                    --organization $(System.CollectionUri) \
+                    --project $project_name || true
+
+                function_app_name=$(basename "$(function_app)")
+                echo "function app sp: $function_app_name"
+                echo "ensure to have this app registration added as user in your azure devops"
+
+                echo "--------------------------------"
+                function_app_user_descriptor=$(az devops user list --organization $(System.CollectionUri)  -o json | jq -r ".members[] | select(.user.displayName == \"$function_app_name\") | .user.descriptor")
+                sleep $(short_sleep)
+
+                #https://learn.microsoft.com/en-us/azure/devops/organizations/security/namespace-reference?view=azure-devops
+                #Release Administrators to be able to managed variable group edit (not always)
+
+                group_release_admin_descriptor=$(az devops security group list   --project $project_name  | jq -r  ' .graphGroups| .[] | select(.displayName == "Project Administrators") | .descriptor')
+                sleep $(short_sleep)
+
+                echo "function app user descriptor: $function_app_user_descriptor"
+                echo "release admin group descriptor: $group_release_admin_descriptor"
+
+                echo "adding sp $function_app_name to $project_name Project Administrators"
+                az devops security group membership add \
+                  --group-id $group_release_admin_descriptor \
+                  --member-id $function_app_user_descriptor
+                sleep $(short_sleep)
+
+                echo "-----------------------------------------------"
+                echo "disable all branch policy temporaly"
+                echo "-----------------------------------------------"
+
+                az repos policy list --project $project_name --organization $(System.CollectionUri) > policies.json
+
+                size=$(cat policies.json | jq 'length')
+
+                echo "size: $size"
+
+                for ((i=0; i<size; i++)); do
+                    policy_id=$(cat policies.json| jq -r ".[$i].id")
+                    az repos policy delete --id $policy_id --project $project_name --organization $(System.CollectionUri) --yes
+                done
+            displayName: "create project"
+            name: project
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: ${{ parameters.automation_principal }} # Name of your Azure service connection
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                #!/bin/bash
+                set -e +H
+                # -e to exit on error
+                # +H to prevent history expansion
+                # Set the script's locale to UTF-8 to ensure proper handling of UTF-8 encoded text
+                export LANG=C.UTF-8
+
+
+                required_repos=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Requiredrepos')
+                service_connections_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.ServiceConnections')
+                subscriptions_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Subscriptions')
+                vargroups_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Variablegroups')
+
+                project_name=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Options' | jq -r '.Project_name' )
+
+                echo $required_repos
+
+                echo "$required_repos" |
+                jq -c -r '.[]' |
+                while IFS= read -r repo; do
+                    reponame=$(echo "$repo" | tr '[:upper:]' '[:lower:]')
+                    echo "-----------------------------------------------"
+                    echo "create azure devops repo $reponame"
+                    echo "-----------------------------------------------"
+                    az repos create --name  $reponame --project $project_name --organization $(System.CollectionUri) || true
+                    az repos list  --project $project_name --organization $(System.CollectionUri) | jq -r ".[] | select(.name== \"$reponame\")" > repocreated.json
+
+                    sleep $(short_sleep)
+                    cloneurl=$(cat repocreated.json | jq  -r '.webUrl')
+
+                    echo "-----------------------------------------------"   
+                    echo "clone url: $cloneurl"
+                    echo "-----------------------------------------------"  
+
+                    mkdir $reponame
+
+                    #https://developercommunity.visualstudio.com/t/unable-to-use-systemaccesstoken-to-clone-git-repo/1683026
+                    #disable Protect access to repositories in YAML pipelines in organization or project level under pipelines>>settings 
+
+                    #For error fatal: could not read Username for 'https://dev.azure.com': terminal prompts disabled
+                    #use the build service TOKEN to connect to the repo 
+                    git config --global http.extraheader "AUTHORIZATION: bearer $(System.AccessToken)"
+
+                    git config --global user.email "automation service@local.com"
+                    git config --global user.name "automation service"
+                    git config --list
+                    git clone $cloneurl ./$reponame
+
+                    items=("master" "develop")
+                    cd $reponame
+                    git fetch
+
+                    #dont add this command on your local machine , keep them on remote pipeline, changes the way merge work locally
+                    git config --global pull.rebase true
+                    git config --global rebase.backend merge
+                    git config --global merge.conflictStyle diff3
+                    git config --global rerere.enabled true
+
+                    #git pull --ff-only  fails if merge/rebase is required
+
+                    for item in "${items[@]}"; do
+                        echo "sync branch: $item"
+                        git checkout -b $item || true
+                        git branch --set-upstream-to=origin/$item $item || true
+                        git pull --rebase -X theirs || true # can be theirs or ours
+                        
+                        #folder are case insensitive in windows, if you work with git and save on filesystem when is pushed into remote server we wont know if have capital letter, consider lowercase
+                        #pipelines-infra pipelines-code
+                        cp -r ../pipelines-$reponame/* .
+
+                        echo "subcription array: $subscriptions_object"
+                        #["dev-mgmt-group-environment", "prod1-mgmt-group-environment"]
+
+                        #sed -i "s#ENVNAMES#$subscriptions_object#" ./$reponame/maindeploy.yaml
+                        sed -i "s#PROJECTNAME#$project_name#" ./maindeploy.yaml
+                        sed -i "s#PROJECTNAME#$project_name#" ./maindestroy.yaml
+
+
+                        yq -i "(.parameters[] | select(.name == \"environment\").values) =$subscriptions_object" ./maindeploy.yaml
+                        yq -i "(.parameters[] | select(.name == \"environment\").values) =$subscriptions_object" ./maindestroy.yaml
+
+                        #TIME=$(date +%Y-%m-%dT%H:%M:%S.%2NZ)
+                        echo "--------------------------------"
+                        echo "commiting changes"
+                        echo "--------------------------------"
+                        echo "#$reponame repo" > README.md && git add . && git commit -m "sync" || true && git push --set-upstream origin $item
+                    done         
+                done
+            displayName: "bootstrap repo creation"
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: ${{ parameters.automation_principal }} # Name of your Azure service connection
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                #!/bin/bash
+                set -e +H
+                # -e to exit on error
+                # +H to prevent history expansion
+                # Set the script's locale to UTF-8 to ensure proper handling of UTF-8 encoded text
+                export LANG=C.UTF-8
+
+                required_repos=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Requiredrepos')
+                service_connections_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.ServiceConnections')
+                subscriptions_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Subscriptions')
+                vargroups_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Variablegroups')
+
+                project_name=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Options' | jq -r '.Project_name' )
+
+                az devops configure --defaults organization=$(System.CollectionUri) project=$project_name 
+
+                echo $required_repos
+                
+                echo "$required_repos" |
+                jq -c -r '.[]' |
+                while IFS= read -r repo; do
+                  reponame=$(echo "$repo" | tr '[:upper:]' '[:lower:]')
+                  echo "-----------------------------------------------"
+                  echo "creating pipelines for repo $reponame"
+                  echo "-----------------------------------------------"
+
+                  names=(
+                    $reponame-pass-develop-branch
+                    $reponame-pass-master-branch
+                    deploy-$reponame
+                    destroy-$reponame
+                  )
+
+                  yamls=(
+                    ./check-branches-develop.yaml
+                    ./check-branches-master.yaml
+                    ./maindeploy.yaml
+                    ./maindestroy.yaml     
+                  )
+
+                  for i in "${!names[@]}"; do
+                    az pipelines create \
+                    --name "${names[$i]}" \
+                    --project "$project_name" \
+                    --repository "$reponame" \
+                    --repository-type tfsgit \
+                    --branch master \
+                    --skip-first-run true \
+                    --yml-path "${yamls[$i]}" || true
+                  done
+
+                  #https://learn.microsoft.com/en-us/cli/azure/repos?view=azure-cli-latest#az-repos-show
+                  #https://learn.microsoft.com/en-us/cli/azure/pipelines/build/definition?view=azure-cli-latest#az-pipelines-build-definition-list
+
+                  subrepository_id=$(az repos show --project  $project_name --repository $reponame --organization $(System.CollectionUri) | jq -r '.id')
+                  echo "repo id: $subrepository_id"
+                  declare -A pipeline_ids=()
+
+                  for i in "${!names[@]}"; do
+                    name="${names[$i]}"
+                    id=$(az pipelines build definition list \
+                        --name "${names[$i]}" \
+                        --organization "$(System.CollectionUri)" \
+                        --project "$project_name" \
+                        --repository "$reponame" \
+                        --repository-type tfsgit \
+                        | jq -r '.[0].id')
+                    sleep $(short_sleep)
+                    pipeline_ids["$name"]="$id"
+                  done
+
+                  echo "-----------------------------------------------"
+                  echo "pass develop  id: ${pipeline_ids[$reponame-pass-develop-branch]}"
+                  echo "pass master  id: ${pipeline_ids[$reponame-pass-master-branch]}"
+                  echo "-----------------------------------------------"
+
+                  #https://learn.microsoft.com/en-us/cli/azure/repos/policy/build?view=azure-cli-latest#az-repos-policy-build-create
+                  definitionsids=(
+                    "${pipeline_ids[$reponame-pass-develop-branch]}"     
+                    "${pipeline_ids[$reponame-pass-master-branch]}"
+                  )
+                  branches=(
+                    develop
+                    master
+                  )
+                  echo "-----------------------------------------------"
+                  echo "creating build branch policies for repo $reponame"
+                  echo "-----------------------------------------------"
+                  for i in "${!branches[@]}"; do
+                    az repos policy build create --blocking true \
+                      --branch "${branches[$i]}"  \
+                      --build-definition-id "${definitionsids[$i]}" \
+                      --display-name "check-${branches[$i]}"  \
+                      --organization $(System.CollectionUri) \
+                      --project $project_name \
+                      --enabled true \
+                      --manual-queue-only false \
+                      --valid-duration 60 \
+                      --queue-on-source-update-only true \
+                      --repository-id "$subrepository_id" || true
+                    sleep $(short_sleep)
+                  done
+
+                  echo "-----------------------------------------------"
+                  echo "creating branch policy approval count for $reponame repo"
+                  echo "-----------------------------------------------"
+
+                  #https://learn.microsoft.com/en-us/cli/azure/repos/policy/approver-count?view=azure-cli-latest#az-repos-policy-approver-count-create
+
+                  for i in "${!branches[@]}"; do
+                    az repos policy approver-count create --allow-downvotes false \
+                      --blocking true \
+                      --branch "${branches[$i]}" \
+                      --creator-vote-counts true \
+                      --enabled true \
+                      --minimum-approver-count 1 \
+                      --repository-id "$subrepository_id"  \
+                      --reset-on-source-push true \
+                      --organization $(System.CollectionUri) \
+                      --project $project_name || true
+                    sleep $(short_sleep)
+                  done
+                done
+            displayName: "pipelines bootstrap"
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: ${{ parameters.automation_principal }} # Name of your Azure service connection
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                #!/bin/bash
+                set -e +H
+                # -e to exit on error
+                # +H to prevent history expansion
+                # Set the script's locale to UTF-8 to ensure proper handling of UTF-8 encoded text
+                export LANG=C.UTF-8
+
+                required_repos=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Requiredrepos')
+                service_connections_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.ServiceConnections')
+                subscriptions_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Subscriptions')
+                vargroups_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Variablegroups')
+
+                project_name=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Options' | jq -r '.Project_name' )
+       
+                az devops configure --defaults organization=$(System.CollectionUri) project=$project_name 
+
+                echo "-----------------------------------------------"
+                echo "creating variable group"
+                echo "-----------------------------------------------"
+
+                echo $vargroups_object
+
+                #https://learn.microsoft.com/en-us/cli/azure/pipelines/variable-group?view=azure-cli-latest#az-pipelines-variable-group-create
+                echo "$vargroups_object" |
+                jq -c '.[]' |
+                while IFS= read -r groupJson; do
+                    groupName=$(echo "$groupJson" | jq -r '.Name')
+                    echo "Group: $groupName"
+
+
+                    group_id=$(az pipelines variable-group create --name "$groupName" \
+                        --variables random=value  \
+                        --authorize true \
+                        --description "variables" \
+                        --organization $(System.CollectionUri) \
+                        --project "$project_name" \
+                        --query id -o tsv || true)
+                    echo "$groupJson" |
+                    jq -r '.Resources[] | [.Key, .Value] | @tsv' |
+                    while IFS=$'\t' read -r key value; do
+                      echo "$key = $value"
+                      az pipelines variable-group variable create --group-id $group_id \
+                          --name "$key"  \
+                          --value "$value" \
+                          --organization $(System.CollectionUri) \
+                          --project $project_name || true 
+                    done
+                    az pipelines variable-group variable delete --group-id $group_id --name random --organization $(System.CollectionUri)  --project $project_name --yes || true
+                    sleep $(short_sleep)
+                done
+            displayName: "create variable group "
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: ${{ parameters.automation_principal }} # Name of your Azure service connection
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                #!/bin/bash
+                set -e +H
+                # -e to exit on error
+                # +H to prevent history expansion
+                # Set the script's locale to UTF-8 to ensure proper handling of UTF-8 encoded text
+                export LANG=C.UTF-8
+
+                #https://learn.microsoft.com/en-us/cli/azure/repos?view=azure-cli-latest#az-repos-create
+                #to allow  Build Service (ORG) from project you must add it manually to Project Administrators
+                #project settings >> permission >> project administrators >> menbers >> add 
+
+                project_name=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Options' | jq -r '.Project_name' )
+
+                echo "-----------------------------------------------"
+                echo "remove default repo"
+                echo "-----------------------------------------------"
+                az repos list  --project $project_name --organization $(System.CollectionUri) > repos.json
+                sleep $(short_sleep)
+
+                repoid_tobe_removed=$(cat repos.json | jq -r ".[] | select(.name ==\"$project_name\").id")
+
+                echo "repo id to be removed: $repoid_tobe_removed "
+
+                if [[ -z "$repoid_tobe_removed" || "$repoid_tobe_removed" == "" ]]; then
+                  echo "default repo doesnt exists"
+                else
+                  echo "removing default repo"
+                  az repos delete --id $repoid_tobe_removed --project $project_name --organization $(System.CollectionUri)  --yes
+                fi
+                sleep $(short_sleep)
+            displayName: "remove default repo"
+          - task: AzureCLI@2
+            #condition: false #skip all this temporal
+            inputs:
+              azureSubscription: ${{ parameters.automation_principal }} # Name of your Azure service connection
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                #!/bin/bash
+                set -e +H
+                # -e to exit on error
+                # +H to prevent history expansion
+                # Set the script's locale to UTF-8 to ensure proper handling of UTF-8 encoded text
+                export LANG=C.UTF-8
+                
+                required_repos=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Requiredrepos')
+                service_connections_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.ServiceConnections')
+                subscriptions_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Subscriptions')
+                vargroups_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Variablegroups')
+
+                project_name=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Options' | jq -r '.Project_name' )
+
+                az account show
+                az devops configure --defaults organization=$(System.CollectionUri)
+                sleep $(short_sleep)
+
+                group_projectadmin_originId=$(az devops security group list   --project $project_name  | jq -r  ' .graphGroups| .[] | select(.displayName == "Project Administrators") | .originId')
+                sleep $(short_sleep)
+                echo "project admin id:  $group_projectadmin_originId"
+                curl -Ss -H "Authorization: Bearer $(System.AccessToken)" -H "Content-Type: application/json" \
+                    -XGET   $(System.CollectionUri)$project_name/_apis/distributedtask/environments?api-version=7.1-preview.1 > environment.json
+                echo ""
+                cat environment.json | jq '.'
+                sleep $(short_sleep)
+                echo $subscriptions_object
+
+                echo "$subscriptions_object" |
+                jq -c -r '.[]' |
+                while IFS= read -r sub; do
+                    echo "-----------------------------------------------"
+                    echo "Creating environment"
+                    echo "-----------------------------------------------"
+                    echo "subscription: $sub"
+                    environment_pipeline_id=$(cat environment.json | jq -r ".value[] | select(.name==\"$sub\") | .id")
+
+                    if [[ -z "$environment_pipeline_id" || "$environment_pipeline_id" == "" || "$environment_pipeline_id" == "null" ]]; then
+                        echo "environment doesnt exists, creating environment $sub"
+
+                        cp creation_environments/environment_creation.json  final_environment_creation.json
+                        sed -i "s#ENV_NAME#$sub#" final_environment_creation.json
+
+                        curl -Ss -H "Authorization: Bearer $(System.AccessToken)" -H "Content-Type: application/json" \
+                        --data @final_environment_creation.json \
+                        -XPOST  $(System.CollectionUri)$project_name/_apis/distributedtask/environments?api-version=7.1-preview.1 
+                        sleep $(short_sleep)
+                        echo ""
+
+                        curl -Ss -H "Authorization: Bearer $(System.AccessToken)" -H "Content-Type: application/json" \
+                        -XGET   $(System.CollectionUri)$project_name/_apis/distributedtask/environments?api-version=7.1-preview.1 > environment.json
+                        echo ""
+                        sleep $(short_sleep)
+                        environment_pipeline_id=$(cat environment.json | jq -r ".value[] | select(.name==\"$sub\") | .id")
+                    fi
+
+                    echo "environment id : $environment_pipeline_id"
+
+                    cp creation_environments/environment_exclusive_lock.json  final_environment_exclusive_lock.json
+                    sed -i "s#ENV_ID#$environment_pipeline_id#" final_environment_exclusive_lock.json
+
+                    curl -Ss -H "Authorization: Bearer $(System.AccessToken)" -H "Content-Type: application/json" \
+                    --data @final_environment_exclusive_lock.json \
+                    -XPOST  $(System.CollectionUri)$project_name/_apis/pipelines/checks/configurations?api-version=7.1-preview.1
+                    sleep $(short_sleep)
+                    echo ""
+
+                    cp creation_environments/environment_approval_check.json  final_environment_approval_check.json
+                    sed -i "s#GROUP_ID_DESCRIPTOR#$group_projectadmin_originId#" final_environment_approval_check.json
+                    sed -i "s#ENV_ID#$environment_pipeline_id#" final_environment_approval_check.json
+                    sleep $(short_sleep)
+                    #https://learn.microsoft.com/en-us/rest/api/azure/devops/approvalsandchecks/check-configurations/list?view=azure-devops-rest-7.1&tabs=HTTP
+                    echo "$(System.CollectionUri)$project_name/_apis/pipelines/checks/configurations?resourceType=environment&resourceId=$environment_pipeline_id&api-version=7.1-preview.1"
+                    CHECK_ID=$(curl -sS -H "Authorization: Bearer $(System.AccessToken)" \
+                              "$(System.CollectionUri)$project_name/_apis/pipelines/checks/configurations?resourceType=environment&resourceId=$environment_pipeline_id&api-version=7.1-preview.1" | jq -r '.value[] | select(.type.name=="Approval") | .id')
+                    echo "existing approval check: $CHECK_ID"
+                    if [[ -z "$CHECK_ID" ]]; then
+                      echo "Creating check"
+                      curl -Ss -H "Authorization: Bearer $(System.AccessToken)" -H "Content-Type: application/json" \
+                      --data @final_environment_approval_check.json \
+                      -X POST "$(System.CollectionUri)$project_name/_apis/pipelines/checks/configurations?api-version=7.1-preview.1"
+                    else
+                      echo "Updating check $CHECK_ID"
+                      curl -Ss -H "Authorization: Bearer $(System.AccessToken)" -H "Content-Type: application/json" \
+                      --data @final_environment_approval_check.json \
+                      -X PATCH  "$(System.CollectionUri)$project_name/_apis/pipelines/checks/configurations/$CHECK_ID?api-version=7.1-preview.1"
+                    fi
+
+                done
+            displayName: "creation pipeline environment"
+          - task: AzureCLI@2
+            #condition: false #skip all this temporal
+            inputs:
+              azureSubscription: ${{ parameters.automation_principal }} # Name of your Azure service connection
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                #!/bin/bash
+                set -e +H
+                # -e to exit on error
+                # +H to prevent history expansion
+                # Set the script's locale to UTF-8 to ensure proper handling of UTF-8 encoded text
+                export LANG=C.UTF-8
+
+                required_repos=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Requiredrepos')
+                service_connections_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.ServiceConnections')
+                subscriptions_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Subscriptions')
+                vargroups_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Variablegroups')
+
+                project_name=$(echo "${{parameters.payload}}" | base64 --decode | jq '.Options' | jq -r '.Project_name' )
+
+                create_rbac=$(echo "${{parameters.payload}}" | base64 --decode  | jq '.Options' | jq -r '.Create_rbac' | tr '[:upper:]' '[:lower:]')
+
+                echo "-----------------------------------------------"
+                echo "recreate rbac : $create_rbac"
+                echo "-----------------------------------------------"
+
+                if [[ "$create_rbac" == "false" ]]; then
+                  echo "ignoring create/recreate rbac, stopping now"
+                  exit 0
+                fi
+
+                echo $service_connections_object
+                echo "$service_connections_object" |
+                jq -c '.[]' |
+                while IFS= read -r svcjson; do
+                    NAME_SP=$(echo "$svcjson" | jq -r '.Name')
+                    SERVICE_CONNECTION_NAME=$(echo "$svcjson" | jq -r '.Name')
+                    scope=$(echo "$svcjson" | jq -r '.Scope')
+                    echo "getting subscription_id for $scope"
+                    PROJECT_ID=$(project.project_id)
+                    SUBCRIPTION_ID=$(az account list -o json | jq -r ".[] | select(.name == \"$scope\") | .id")
+
+                    TIME=$(date +%Y-%m-%dT%H:%M:%S.%2NZ)
+                    echo "-----------------------------------------------"
+
+                    echo "Deploying to environment: $scope"
+                    echo "service principal name: $NAME_SP"
+                    echo "service connection name: $SERVICE_CONNECTION_NAME"
+                    echo "project name: $project_name"
+                    echo "project id: $PROJECT_ID "
+                    echo "subcription id : $SUBCRIPTION_ID"
+                    echo "time: $TIME"
+                    echo "getting account metadata"
+                    echo "-----------------------------------------------"
+                    az account set --subscription $SUBCRIPTION_ID
+
+                    #this requires user access administrador on the application registration in entra id over the managementr group defined <<--false
+                    #the correct way is to go to "Roles and administrators", assign Application Administrator to the user or app reg
+
+                    echo "-----------------------------------------------"
+                    echo "checking app registration and service principal"
+                    echo "-----------------------------------------------"
+
+                    #instead of querying to check if it exists, get metadata and then just dont create, it will make the same api calls qty than actually creating so doesnt make ant difference
+
+                    oldid=$(az ad app list --display-name $NAME_SP  | jq -r '.[].id')
+                    echo "app reg name: $NAME_SP"
+                    echo "old app reg id: $oldid"
+
+                    if [[ -z "$oldid" || "$oldid" == "" ]]; then
+                      echo "$NAME_SP as app reg doesnt exists"
+                    else
+                      echo "$NAME_SP as app reg exists, removing"
+                      az ad app delete --id $oldid 
+                      sleep $(long_sleep)
+                    fi
+
+                    oldspid=$(az ad sp list --display-name $NAME_SP  | jq -r '.[].id')
+                    echo "old sp id: $oldspid "
+
+                    if [[ -z "$oldspid" || "$oldspid" == "" ]]; then
+                      echo "$NAME_SP as sp doesnt exists "
+                    else
+                      echo "$NAME_SP as sp exists, removing"
+                      az ad sp delete --id $oldspid 
+                      sleep $(long_sleep)
+                    fi
+
+                    echo "-----------------------------------------------"
+                    echo "creating app registration and service principal"
+                    echo "-----------------------------------------------"
+
+                    app_reg_id=$(az ad app create --display-name "$NAME_SP" --query appId -o tsv)
+                    sleep $(long_sleep)
+                    sp_objectid=$(az ad sp create --id "$app_reg_id" --query id -o tsv)
+                    sleep $(long_sleep)
+                    tenant_id=$(az account show --query tenantId -o tsv)
+
+                    echo "-----------------------------------------------"
+
+                    echo "application id : $app_reg_id" #this is actually the appid not the objectid
+                    echo "sp object id: $sp_objectid"
+                    echo "tenant id : $tenant_id"
+                    echo "-----------------------------------------------"
+                    echo "service connection: $NAME_SP"
+
+                    echo $svcjson
+                    echo "-----------------------------------------------"                
+                    echo "$svcjson" |
+                    jq -r '.Resources[] | [.AzureResourceId, .Rbac] | @tsv' |
+                    while IFS=$'\t' read -r AzureResourceId Rbac; do
+                        echo "azure resourceid : $AzureResourceId "
+                        echo "Rbac: $Rbac"
+                        # do something per key/value here
+                        az role assignment create \
+                          --assignee-object-id "$sp_objectid" \
+                          --assignee-principal-type ServicePrincipal \
+                          --role "$Rbac" \
+                          --scope $AzureResourceId
+
+                    done
+
+                    # this is important since this file is modified in a loop, each time the loop start the file need to be fresh to be replaced
+                    cp creation_service_connection/service_connection_template.json final_service_connection_template.json
+
+                    sed -i "s#CLIENT_ID#$app_reg_id#" final_service_connection_template.json
+                    sed -i "s#TENANT_ID#$tenant_id#" final_service_connection_template.json
+                    sed -i "s#TIMEDATE#$TIME#" final_service_connection_template.json
+                    sed -i "s#SUBSCRIPTION_ID#$SUBCRIPTION_ID#" final_service_connection_template.json
+                    sed -i "s#SUBSCRIPTION_NAME#$scope#" final_service_connection_template.json
+                    sed -i "s#SERVICE_CONNECTION_NAME#$SERVICE_CONNECTION_NAME#" final_service_connection_template.json
+                    sed -i "s#PROJECT_ID#$PROJECT_ID#" final_service_connection_template.json
+                    sed -i "s#PROJECT_NAME#$project_name#" final_service_connection_template.json
+                    echo "-----------------------------------------------"
+                    echo "creating service endpoint"
+                    echo "-----------------------------------------------"
+
+                    az devops service-endpoint list --project $project_name --org $(System.CollectionUri) --query "[?name=='$SERVICE_CONNECTION_NAME']"  | jq '.[0]' > firstcreationresults.json
+                    sleep $(short_sleep)
+
+                    result_id=$(cat firstcreationresults.json | jq -r '.id')
+
+                    if [[ -z "$result_id" || "$result_id" == "" || "$result_id" == "null"  ]]; then
+                        echo "service endpoint doesnt exists"
+                    else
+                      echo "old service endpoint id: $result_id"
+                      echo "service endpoint exists, removing it "
+                      az devops service-endpoint delete --id $result_id  --project $project_name --org $(System.CollectionUri) --yes
+                      sleep $(short_sleep)
+                    fi
+
+                    #need to verify if connection already exists
+                    az devops service-endpoint create --service-endpoint-configuration ./final_service_connection_template.json --org $(System.CollectionUri) --project $project_name --output json  > creationresults.json || true
+                    sleep $(short_sleep)
+
+                    ISSUER_URL=$(jq -r .authorization.parameters.workloadIdentityFederationIssuer creationresults.json)
+                    SUBJECT=$(jq -r .authorization.parameters.workloadIdentityFederationSubject creationresults.json)
+
+                    echo "ISSUER_URL: $ISSUER_URL"
+                    echo "subject: $SUBJECT"
+                    echo "creating federal credential"
+                    echo "-----------------------------------------------"
+                    fedcred_id=$(az ad app federated-credential list --id $app_reg_id | jq -r '.[0].id')
+                    echo "fed cred id: $fedcred_id"
+                    echo "-----------------------------------------------"
+                    sleep $(short_sleep)
+
+                    if [[ -z "$fedcred_id" || "$fedcred_id" == "null" ]]; then
+                      echo "fed cred id is null"
+                    else
+                      echo "fed cred id is not null"
+                      echo "removing old federated credential"
+                      az ad app federated-credential delete \
+                        --id $app_reg_id \
+                        --federated-credential-id $fedcred_id
+                      sleep $(short_sleep)
+                    fi
+
+                    az ad app federated-credential create --id $app_reg_id --parameters "{\"name\":\"federacion-$scope-devops\",\"issuer\":\"$ISSUER_URL\",\"subject\":\"$SUBJECT\",\"audiences\":[\"api://AzureADTokenExchange\"]}" 
+                    sleep $(short_sleep)
+
+                done
+            displayName: configure azure devops 
+          - task: AzureCLI@2
+            #condition: false #skip all this temporal
+            inputs:
+              azureSubscription: ${{ parameters.automation_principal }} # Name of your Azure service connection
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                #!/bin/bash
+                set -e +H
+                # -e to exit on error
+                # +H to prevent history expansion
+                # Set the script's locale to UTF-8 to ensure proper handling of UTF-8 encoded text
+                export LANG=C.UTF-8
+
+                service_connections_object=$(echo "${{parameters.payload}}" | base64 --decode | jq '.ServiceConnections')
+
+                echo "-----------------------------------------------"
+                echo "clearing null rbac asignment "
+                echo "-----------------------------------------------"
+
+                unique_subscriptions=$(echo "$service_connections_object" |  jq -r '.[] | .Resources[]  | .AzureResourceId | capture("/subscriptions/(?<sub>[^/]+)")  | .sub' | sort -u)
+
+                while IFS= read -r sub; do
+                  echo "cleaning for Subscription: $sub"
+                  to_be_erased=$(az role assignment list \
+                    --all \
+                    --query "[?principalName==''].id" \
+                    --output tsv)
+
+                  for id in $to_be_erased; do
+                    az role assignment delete --ids "$id"
+                    sleep $(short_sleep)
+                  done
+
+                  az account set --subscription "$sub"
+                done <<< "$unique_subscriptions"
+            displayName: clear null asignment

@@ -1,0 +1,38 @@
+name: for-develop-$(Build.SourceBranchName)-$(Date:yyyyMMdd)-$(Build.SourceVersion)
+trigger: none
+
+variables:
+  - name: brancheslinux
+    value: (feature/.*|master)
+  - name: brancheswindows
+    value: (feature/.+|master)$
+  - name: targetbranch
+    value:  develop 
+
+#https://learn.microsoft.com/es-es/azure/devops/pipelines/agents/hosted?view=azure-devops&tabs=macos-images%2Cyaml
+pool: 
+  vmImage: 'ubuntu-latest' #ubuntu-latest #macOS-latest
+
+stages:
+- stage: checkifcontinue
+  jobs:
+  - job: validate
+    steps:
+    - script: |
+        echo "Target branch: $(System.PullRequest.TargetBranch)"
+        echo "Source branch: $(System.PullRequest.SourceBranch)"
+      displayName: 'show target branch'
+      condition: eq(variables['Build.Reason'], 'PullRequest') 
+      
+    - script: |
+        echo "Source branch: $(System.PullRequest.SourceBranch)"
+        if [[ "$(System.PullRequest.SourceBranch)" =~ ^refs/heads/$(brancheslinux)$ ]]; then
+          echo "Allowed branch"
+        else
+          echo "Only $(brancheslinux) can be merged into $(targetbranch)"
+          exit 1
+        fi
+      condition: and(eq(variables['Agent.OS'], 'Linux'),eq(variables['Build.Reason'], 'PullRequest') )
+      displayName: 'check if allowed when linux'
+
+

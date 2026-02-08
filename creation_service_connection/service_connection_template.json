@@ -1,0 +1,40 @@
+{
+    "authorization": {
+        "parameters": {
+            "serviceprincipalid": "CLIENT_ID",
+            "tenantid": "TENANT_ID",
+            "workloadIdentityFederationIssuerType": "EntraID"
+        },
+        "scheme": "WorkloadIdentityFederation"
+    },
+    "creationDate": "TIMEDATE",
+    "data": {
+        "creationMode": "Manual",
+        "environment": "AzureCloud",
+        "identityType": "AppRegistrationManual",
+        "scopeLevel": "Subscription",
+        "subscriptionId": "SUBSCRIPTION_ID",
+        "subscriptionName": "SUBSCRIPTION_NAME"
+    },
+    "description": "SERVICE_CONNECTION_NAME",
+    "id": "fe4dec8c-43f0-4270-94ae-5a8d7350e8e7",
+    "isOutdated": false,
+    "isReady": true,
+    "isShared": false,
+    "modificationDate": "TIMEDATE",
+    "name": "SERVICE_CONNECTION_NAME",
+    "owner": "Library",
+    "serviceEndpointProjectReferences": [
+        {
+            "description": "SERVICE_CONNECTION_NAME",
+            "name": "SERVICE_CONNECTION_NAME",
+            "projectReference": {
+                "id": "PROJECT_ID",
+                "name": "PROJECT_NAME"
+            }
+        }
+    ],
+    "serviceManagementReference": null,
+    "type": "azurerm",
+    "url": "https://management.azure.com/"
+}
